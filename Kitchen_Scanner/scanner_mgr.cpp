@@ -11,11 +11,26 @@ static const int SCANNER_BAUD = 9600;
 static SoftwareSerial scannerSerial(SCANNER_RX_PIN, -1);
 
 static const uint32_t DUP_MS = 700;
+static const uint8_t MIN_CODE_LEN = 6;
+static const uint8_t MAX_CODE_LEN = 64;
+static const uint8_t MAX_BUFFER_LEN = 128;
+static const uint16_t MODE_WIPE_MS = 900;
+static const uint16_t SCAN_FLASH_MS = 120;
+
 static String lastCode;
 static uint32_t lastScanMs = 0;
 
 enum ScanMode : uint8_t { MODE_IN = 0, MODE_OUT = 1 };
 static ScanMode scanMode = MODE_IN;
+
+static bool isAllowedCodeChar(char c) {
+  return (
+    (c >= '0' && c <= '9') ||
+    (c >= 'A' && c <= 'Z') ||
+    (c >= 'a' && c <= 'z') ||
+    c == '-' || c == '_' || c == '.' || c == ':' || c == '/'
+  );
+}
 
 static void applyModeFromCfg() {
   scanMode = (cfg.role == "ausgang") ? MODE_OUT : MODE_IN;
@@ -25,12 +40,15 @@ static void applyModeFromCfg() {
 const char* modeToText() {
   return (scanMode == MODE_IN) ? "hinzufuegen (IN)" : "entfernen (OUT)";
 }
+
 const char* modeToSource() {
   return (scanMode == MODE_OUT) ? "ausgang" : "eingang";
 }
+
 const char* actionToText() {
   return (scanMode == MODE_IN) ? "in" : "out";
 }
+
 const char* currentTopic() {
   return (scanMode == MODE_OUT) ? TOPIC_OUT : TOPIC_IN;
 }
@@ -57,23 +75,40 @@ void toggleModeIfAllowed() {
   Serial.print("[MODE] ");
   Serial.println(modeToText());
 
-  ledStartWipe(900);
+  ledStartWipe(MODE_WIPE_MS);
   displayText = (scanMode == MODE_IN) ? "IN" : "OUT";
   displayDirty = true;
 }
 
-static bool looksLikeCode(const String& s) {
-  if (s.length() < 6 || s.length() > 64) return false;
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (!(
-      (c >= '0' && c <= '9') ||
-      (c >= 'A' && c <= 'Z') ||
-      (c >= 'a' && c <= 'z') ||
-      c == '-' || c == '_' || c == '.' || c == ':' || c == '/'
-    )) return false;
+static bool looksLikeCode(const String& code) {
+  if (code.length() < MIN_CODE_LEN || code.length() > MAX_CODE_LEN) return false;
+
+  for (size_t i = 0; i < code.length(); i++) {
+    if (!isAllowedCodeChar(code[i])) return false;
   }
+
   return true;
+}
+
+static String buildPayload(const String& code, uint32_t uptimeMs) {
+  String payload = "{";
+  payload += "\"ean\":\"" + code + "\",";
+  payload += "\"qty\":1,";
+  payload += "\"action\":\"" + String(actionToText()) + "\",";
+  payload += "\"source\":\"" + String(modeToSource()) + "\",";
+  payload += "\"uptime_ms\":" + String(uptimeMs);
+  payload += "}";
+  return payload;
+}
+
+static void processScannerBuffer(const String& bufferContent) {
+  if (looksLikeCode(bufferContent)) {
+    publishScan(bufferContent);
+    return;
+  }
+
+  Serial.print("[WARN] Unplausibel: ");
+  Serial.println(bufferContent);
 }
 
 void publishScan(const String& code) {
@@ -83,6 +118,7 @@ void publishScan(const String& code) {
     Serial.println("[SKIP] Doppelscan ignoriert");
     return;
   }
+
   lastCode = code;
   lastScanMs = now;
 
@@ -91,7 +127,7 @@ void publishScan(const String& code) {
   Serial.print(" -> ");
   Serial.println(modeToText());
 
-  ledStartFlash(120);
+  ledStartFlash(SCAN_FLASH_MS);
   displayDirty = true;
 
   triggerHoldStop("scan");
@@ -100,35 +136,27 @@ void publishScan(const String& code) {
   if (cfg.mqtt_host.length() == 0) return;
   if (!mqtt.connected()) return;
 
-  String payload = "{";
-  payload += "\"ean\":\"" + code + "\",";
-  payload += "\"qty\":1,";
-  payload += "\"action\":\"" + String(actionToText()) + "\",";
-  payload += "\"source\":\"" + String(modeToSource()) + "\",";
-  payload += "\"uptime_ms\":" + String(now);
-  payload += "}";
-
+  String payload = buildPayload(code, now);
   mqtt.publish(currentTopic(), payload.c_str(), false);
 }
 
 void processScanner() {
   static String buf;
+
   while (scannerSerial.available() > 0) {
     char c = (char)scannerSerial.read();
+
     if (c == '\n' || c == '\r') {
       if (buf.length() > 0) {
-        String s = buf;
+        String completeScan = buf;
         buf = "";
-        if (looksLikeCode(s)) publishScan(s);
-        else {
-          Serial.print("[WARN] Unplausibel: ");
-          Serial.println(s);
-        }
+        processScannerBuffer(completeScan);
       }
-    } else {
-      if (c >= 32 && c <= 126) {
-        if (buf.length() < 128) buf += c;
-      }
+      continue;
+    }
+
+    if (c >= 32 && c <= 126 && buf.length() < MAX_BUFFER_LEN) {
+      buf += c;
     }
   }
 }
